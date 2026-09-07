@@ -222,7 +222,7 @@ function tickPose(ev) {
     const ready = ev.inPose && ev.score >= 0.7;
     S.inFrames = ready ? S.inFrames + 1 : 0;
     setState(ev.inPose ? (ready ? 'Almost…' : 'Adjust') : 'Get in position');
-    if (!ev.inPose) cue(S.pose.hint, '');
+    setupGuidance(ev);
     if (S.inFrames >= ENTER_FRAMES) enterHold();
     return;
   }
@@ -283,6 +283,15 @@ function trackPhaseAndReps(ev) {
   }
 }
 
+/** While getting into a pose, say what is stopping you — otherwise "Adjust" is a dead end. */
+function setupGuidance(ev) {
+  if (!ev.inPose) { cue(S.pose.hint, ''); return; }
+  const worst = ev.checks
+    .filter((c) => c.status === 'off' || c.status === 'close')
+    .sort((a, b) => b.severity - a.severity)[0];
+  cue(worst ? worst.cue : 'Hold it there', worst ? '' : 'good');
+}
+
 /** One cue at a time: the worst thing that has been visibly wrong for over a beat. */
 function coach(ev) {
   const now = performance.now();
@@ -303,6 +312,7 @@ function tickCalibrate(ev) {
   if (S.phase === 'setup') {
     S.inFrames = ev.inPose ? S.inFrames + 1 : 0;
     setState(ev.inPose ? 'Hold still…' : 'Get in position');
+    if (!ev.inPose) cue(S.pose.hint, '');
     if (S.inFrames >= ENTER_FRAMES) {
       S.phase = 'hold'; S.holdStart = performance.now(); resetChecks(S.pose);
       voice.say('Hold your best version. Recording.', { force: true });
@@ -365,6 +375,7 @@ function tickFlow(ev) {
     const ready = ev.inPose && ev.score >= 0.7;
     S.inFrames = ready ? S.inFrames + 1 : 0;
     setState(ready ? 'Almost…' : `Start in ${S.pose.name}`);
+    setupGuidance(ev);
     if (S.inFrames >= 10) { S.phase = 'hold'; S.holdStart = now; enterStep(now); }
     return;
   }
