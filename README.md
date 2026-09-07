@@ -65,8 +65,9 @@ python -m http.server 5187 --directory .
 
 Then open `http://localhost:5187`. Camera access needs `localhost` or HTTPS.
 
-- `node test.mjs` — 60 tests: geometry, reference self-validation, the confusion matrix,
-  degradation cases, occlusion handling, calibration overrides. No camera or browser needed.
+- `node test.mjs` — 54 assertions: geometry, reference self-validation, the confusion matrix,
+  degradation cases, occlusion handling, calibration overrides, ghost-overlay fit. No camera
+  or browser needed.
 - `?demo=1` — drives the whole session UI from a synthetic body. No camera. Useful for testing
   and for showing someone how it works.
 
