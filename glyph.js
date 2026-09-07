@@ -66,8 +66,8 @@ export function drawGhost(ctx, ghost, scale = 1) {
     ctx.lineTo(ghost[b].x, ghost[b].y);
     ctx.stroke();
   }
-  ctx.fillStyle = 'rgba(198,255,61,0.30)';
-  const r = dist(ghost[11], ghost[23]) * 0.22;
+  ctx.fillStyle = 'rgba(198,255,61,0.22)';
+  const r = dist(ghost[11], ghost[23]) * 0.18;
   ctx.beginPath();
   ctx.arc(ghost[0].x, ghost[0].y, r, 0, Math.PI * 2);
   ctx.fill();

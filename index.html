@@ -67,15 +67,15 @@
     </div>
 
     <div class="chips">
-      <span class="chip" id="stateChip">Get in position</span>
+      <span class="chip" id="stateChip" role="status" aria-live="polite">Get in position</span>
       <span class="chip alt" id="sideChip" hidden></span>
       <span class="chip alt" id="phaseChip" hidden></span>
       <span class="chip alt" id="repChip" hidden></span>
     </div>
 
     <div class="calibbar" id="calibBar" hidden>Calibration — your numbers become the target</div>
-    <div class="status" id="statusMsg" hidden></div>
-    <div class="cue" id="cueBar"></div>
+    <div class="status" id="statusMsg" role="alert" hidden></div>
+    <div class="cue" id="cueBar" role="status" aria-live="assertive"></div>
   </div>
 
   <aside class="panel">

@@ -134,7 +134,7 @@ async function startPose(id, mode = 'pose') {
     : S.pose.hint);
 }
 async function startFlow(id) {
-  S.mode = 'flow'; S.seq = SEQUENCES.find((s) => s.id === id); S.stepIdx = 0; S.flowLog = [];
+  S.mode = 'flow'; S.seq = SEQUENCES.find((s) => s.id === id); S.stepIdx = 0; S.flowLog = []; S.side = null;
   S.pose = POSE_BY_ID[S.seq.steps[0]];
   await begin(S.seq.name, `Step 1 · ${S.pose.name}`, S.seq.hint);
 }
@@ -174,13 +174,13 @@ function loop() {
   if (DEMO) {
     const r = el.stage.getBoundingClientRect();
     w = Math.round(r.width) || 640; h = Math.round(r.height) || 480;
-    if (el.overlay.width !== w) { el.overlay.width = w; el.overlay.height = h; }
+    if (el.overlay.width !== w || el.overlay.height !== h) { el.overlay.width = w; el.overlay.height = h; }
     raw = demoFn((performance.now() - demoT0) / 1000, w, h);
   } else {
     if (!landmarker || v.readyState < 2 || v.currentTime === lastVideoTime) return;
     lastVideoTime = v.currentTime;
     w = v.videoWidth; h = v.videoHeight;
-    if (el.overlay.width !== w) { el.overlay.width = w; el.overlay.height = h; }
+    if (el.overlay.width !== w || el.overlay.height !== h) { el.overlay.width = w; el.overlay.height = h; }
     let res;
     try { res = landmarker.detectForVideo(v, performance.now()); } catch { return; }
     if (!res.landmarks?.length) {
@@ -372,6 +372,7 @@ function tickFlow(ev) {
   S.holdMs = now - S.holdStart;
   renderTimer(S.holdMs, false); renderChecks(ev); renderScore(ev.score);
   accumulate(ev); coach(ev);
+  if (ev.side && !S.side) { S.side = ev.side; el.sideChip.hidden = false; el.sideChip.textContent = `${ev.side} side`; }
   const cur = S.flowLog.at(-1);
   cur.bestScore = Math.max(cur.bestScore, ev.score);
 
@@ -381,6 +382,10 @@ function tickFlow(ev) {
     return;
   }
   const nextPose = POSE_BY_ID[S.seq.steps[nextIdx]];
+  // In demo mode, pretend the practitioner moves on after a few seconds in each shape.
+  if (DEMO && now - cur.enteredAt > 3000 && !cur.moved) {
+    cur.moved = true; demoFn = demoSource(nextPose); demoT0 = performance.now();
+  }
   const nextEv = evaluate(nextPose, S.lm, store.tuningFor(nextPose.id));
   S.nextFrames = (nextEv.inPose && nextEv.score >= 0.7 && nextEv.score > ev.score) ? S.nextFrames + 1 : 0;
   if (S.nextFrames >= 8 && now - cur.enteredAt > 800) {
@@ -451,7 +456,10 @@ function finishFlow() {
   S.phase = 'done'; stopCamera(); voice.stop();
   const total = Math.round((performance.now() - S.flowLog[0].enteredAt) / 1000);
   const weakest = [...S.flowLog].sort((a, b) => a.bestScore - b.bestScore)[0];
-  const text = `${S.seq.name} complete in ${total} seconds. ${weakest.name} was your weakest shape, at ${pct(weakest.bestScore)}.`;
+  const text = `${S.seq.name} complete in ${total} seconds. `
+    + (weakest.bestScore >= 0.9
+      ? 'Every shape landed cleanly.'
+      : `${weakest.name} was the shape to work on, at ${pct(weakest.bestScore)}.`);
   store.addEntry({ poseId: S.seq.id, name: S.seq.name, secs: total, score: S.flowLog.reduce((t, s) => t + s.bestScore, 0) / S.flowLog.length, side: null });
   el.sumTitle.textContent = `${S.seq.name} · ${total}s`;
   el.sumLead.textContent = text;
@@ -542,10 +550,11 @@ function show(id) {
 // ---------------------------------------------------------------- home
 function renderHome() {
   const sum = store.summary();
+  const mins = Math.round(sum.secondsThisWeek / 60);
   el.stats.innerHTML = `
-    <div class="stat"><b>${sum.streak}</b><span>day streak</span></div>
-    <div class="stat"><b>${sum.holdsThisWeek}</b><span>holds this week</span></div>
-    <div class="stat"><b>${Math.round(sum.secondsThisWeek / 60)}</b><span>minutes</span></div>`;
+    <div class="stat"><b>${sum.streak}</b><span>day${sum.streak === 1 ? '' : 's'} in a row</span></div>
+    <div class="stat"><b>${sum.holdsThisWeek}</b><span>hold${sum.holdsThisWeek === 1 ? '' : 's'} this week</span></div>
+    <div class="stat"><b>${mins}</b><span>minute${mins === 1 ? '' : 's'}</span></div>`;
   el.stats.hidden = sum.total === 0;
 
   el.poseGrid.innerHTML = POSES.map((p) => {
