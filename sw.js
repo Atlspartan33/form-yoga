@@ -5,7 +5,7 @@
 // live at versioned URLs, so those are cache-first — the expensive part downloads once.
 const APP = 'form-app-v3';
 const VENDOR = 'form-vendor-v1';
-const SHELL = ['./', './index.html', './styles.css', './app.js', './poses.js', './glyph.js', './store.js',
+const SHELL = ['./', './index.html', './styles.css', './app.js', './poses.js', './glyph.js', './store.js', './demo.js',
   './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 const VENDOR_HOSTS = ['cdn.jsdelivr.net', 'storage.googleapis.com'];
 
@@ -42,7 +42,12 @@ self.addEventListener('fetch', (e) => {
       if (res.ok) (await caches.open(APP)).put(request, res.clone());
       return res;
     } catch {
-      return (await caches.match(request)) || (await caches.match('./index.html')) || Response.error();
+      const hit = await caches.match(request);
+      if (hit) return hit;
+      // Only a navigation may fall back to the shell. Handing index.html to a failed
+      // module request serves HTML as a script, and the app boots to a blank page.
+      if (request.mode === 'navigate') return (await caches.match('./index.html')) || Response.error();
+      return Response.error();
     }
   })());
 });

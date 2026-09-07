@@ -13,7 +13,7 @@ export function demoSource(pose) {
   return (t, w, h) => {
     const scale = Math.min(w, h) / 260;
     const ox = w / 2 - 100 * scale, oy = h / 2 - 100 * scale;
-    const wobble = Math.sin(t * 0.55) * 26;          // slow, large: swings the verdict
+    const wobble = Math.sin(t * 0.55) * 13;          // slow: swings the verdict good <-> off
     const breathe = Math.sin(t * 2.1) * 1.4;         // small: keeps the skeleton alive
     return base.map((p, i) => {
       const d = DRIFT.includes(i) ? wobble : 0;

@@ -50,12 +50,39 @@ three jobs from one source of truth:
 3. a self-test — **each reference must score 1.0 against its own spec**, so the picture on the tile
    is provably the thing the checker is looking for.
 
+## Sign-aware checks
+
+Absolute values make mirror-image faults invisible, and the two that matter are both
+injury patterns:
+
+- **Chair.** Hinging forward 19° and leaning *back* 19° are the same number to an unsigned
+  torso angle. Leaning back in Utkatasana loads the low back — the app used to score it as
+  perfect form. `leanSigned` resolves the torso against the direction you face, so leaning
+  back reads −19° and fails.
+- **Warrior II.** A knee splayed outside the ankle and a knee collapsing *inward* toward the
+  midline are the same distance. Medial collapse is the classic Warrior II knee injury, and
+  the check written to catch it couldn't see it. `kneeTrack` signs the offset along the foot's
+  outward axis, so inward reads negative and gets its own cue.
+
+Facing is measured from the head against the **shoulders**, not the hips: with a near-vertical
+torso the head sits almost directly above the hips, so that comparison flips on noise.
+
+## Honest timing
+
+Hold time accrues **per frame actually seen**, never from a wall clock. Background the app or
+step out of frame and the timer simply stops. Wall-clock timing meant a 30-second hold that you
+walked away from for two minutes completed itself and wrote 120 seconds into your history,
+scored from the handful of easy frames right after you entered.
+
 ## Calibration
 
 Shipped target ranges are hand-authored guesses. If one is wrong for your body, hit **Calibrate**:
 hold your best version for 8 seconds, and the app takes the median of each measurement and widens
-the range to include it. It only ever widens — calibration can't make the checker stricter than
-shipped, so it can't quietly turn into "everything you do is perfect."
+the range to include it. Three rules keep it honest: it only ever **widens** (calibration can't make
+the checker stricter than shipped), it always widens from the **shipped** range rather than from
+your last calibration (so repeat sessions on off days can't ratchet a check open until it never
+fails), and the result is **capped at 1.5×** the shipped width. There's a per-pose reset back to
+shipped values.
 
 ## Running it
 
@@ -65,9 +92,10 @@ python -m http.server 5187 --directory .
 
 Then open `http://localhost:5187`. Camera access needs `localhost` or HTTPS.
 
-- `node test.mjs` — 54 assertions: geometry, reference self-validation, the confusion matrix,
-  degradation cases, occlusion handling, calibration overrides, ghost-overlay fit. No camera
-  or browser needed.
+- `node test.mjs` — 88 assertions: geometry, reference self-validation, the confusion matrix,
+  degradation cases, occlusion and malformed-landmark handling, corrupt calibration, the
+  sign-aware checks, the flow advance rule, ghost-overlay fit, and `store.js` against an
+  injected localStorage. No camera or browser needed.
 - `?demo=1` — drives the whole session UI from a synthetic body. No camera. Useful for testing
   and for showing someone how it works.
 
@@ -87,6 +115,10 @@ not verdicts, and never medical advice.
 tabletop base underneath it: shoulders over wrists, hips over knees, arms straight. The Cat/Cow
 phase label and the rep counter track the movement from head height, which works, but nothing is
 grading the shape of your spine.
+
+**Depth is still invisible.** The sign-aware checks above fix the two mirror-image faults that
+matter most, but they work in the image plane. A fault that happens along the camera axis — a hip
+rotating toward or away from the lens — remains unmeasurable from one camera.
 
 **Target ranges are hand-authored.** They're informed guesses, not population data. When one is
 wrong for your body, that's a bug in the number, not in you — hit Calibrate.

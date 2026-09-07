@@ -17,10 +17,22 @@ export function saveSettings(patch = {}) {
 
 // ---------- calibration ----------
 // { [poseId]: { [checkId]: [lo, hi] } } — overrides the shipped target ranges.
-export const tuning = read(KEY.tuning, {});
+const validRange = (r) => Array.isArray(r) && r.length === 2 && Number.isFinite(r[0]) && Number.isFinite(r[1]) && r[0] <= r[1];
+const asTuning = (v) => {
+  const out = {};
+  if (!v || typeof v !== 'object') return out;
+  for (const [pose, ranges] of Object.entries(v)) {
+    if (!ranges || typeof ranges !== 'object') continue;
+    const keep = Object.fromEntries(Object.entries(ranges).filter(([, r]) => validRange(r)));
+    if (Object.keys(keep).length) out[pose] = keep;
+  }
+  return out;
+};
+export const tuning = asTuning(read(KEY.tuning, {}));
 export function tuningFor(poseId) { return tuning[poseId] || null; }
 export function saveTuning(poseId, ranges) {
-  tuning[poseId] = { ...(tuning[poseId] || {}), ...ranges };
+  const keep = Object.fromEntries(Object.entries(ranges).filter(([, r]) => validRange(r)));
+  tuning[poseId] = { ...(tuning[poseId] || {}), ...keep };
   write(KEY.tuning, tuning);
 }
 export function clearTuning(poseId) {
@@ -32,7 +44,10 @@ export const isTuned = (poseId) => !!tuning[poseId];
 // ---------- history ----------
 // [{ ts, poseId, name, secs, score, side, reps, checks: { [id]: goodFraction } }]
 const MAX_ENTRIES = 400;
-export const history = read(KEY.history, []);
+// A well-formed JSON value of the wrong shape would otherwise crash summary() at
+// module scope, leaving a home screen with no tiles and no way to clear the data.
+const asArray = (v) => (Array.isArray(v) ? v.filter((r) => r && typeof r === 'object' && Number.isFinite(r.ts)) : []);
+export const history = asArray(read(KEY.history, []));
 export function addEntry(entry) {
   history.unshift({ ts: Date.now(), ...entry });
   if (history.length > MAX_ENTRIES) history.length = MAX_ENTRIES;
@@ -66,14 +81,14 @@ export function summary() {
 }
 
 /** Per-pose stats: attempts, best and recent score, and left/right balance. */
-export function statsFor(poseId) {
-  const rows = history.filter((h) => h.poseId === poseId);
+export function statsFor(poseId, side = null) {
+  const rows = history.filter((h) => h.poseId === poseId && (!side || h.side === side));
   if (!rows.length) return null;
   const sides = { Left: 0, Right: 0 };
   for (const r of rows) if (r.side) sides[r.side]++;
   return {
     count: rows.length,
-    best: Math.max(...rows.map((r) => r.score)),
+    best: Math.max(...rows.map((r) => (Number.isFinite(r.score) ? r.score : 0))),
     recent: rows[0].score,
     lastAt: rows[0].ts,
     sides,

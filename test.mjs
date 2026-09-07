@@ -1,6 +1,6 @@
 // node test.mjs — geometry unit tests + a self-eval of the pose specs.
 // No camera, no browser. Synthetic skeletons only.
-import { POSES, POSE_BY_ID, evaluate, angleAt, refLandmarks, severity, statusOf } from './poses.js';
+import { POSES, POSE_BY_ID, SEQUENCES, evaluate, angleAt, refLandmarks, severity, statusOf } from './poses.js';
 
 let fails = 0;
 const ok = (name, cond, detail = '') => {
@@ -136,7 +136,6 @@ ok('widened range can pass a bad pose', st(loose, 'line') === 'good');
 
 // ---------------------------------------------------------------------------
 console.log('\n— sequences —');
-const { SEQUENCES } = await import('./poses.js');
 for (const s of SEQUENCES) {
   ok(`${s.id} steps all exist`, s.steps.every((id) => POSE_BY_ID[id]), s.steps.join(' → '));
 }
@@ -171,6 +170,134 @@ const gf = fitRef(wd, fev, flipped);
 const noseSideUser = Math.sign(flipped[0].x - fev.hip.x);
 const noseSideGhost = Math.sign(gf[0].x - (gf[23].x + gf[24].x) / 2);
 ok('ghost flips to match the user facing', noseSideUser === noseSideGhost, `user ${noseSideUser}, ghost ${noseSideGhost}`);
+
+// ---------------------------------------------------------------------------
+// Malformed input must degrade to 'unknown', never throw and never score.
+// ---------------------------------------------------------------------------
+console.log('\n— malformed landmarks —');
+const mp = POSE_BY_ID.warrior2;
+for (const [name, input] of [
+  ['empty array', []],
+  ['truncated array', refLandmarks(mp).slice(0, 20)],
+  ['null entry', refLandmarks(mp).map((p, i) => (i === 25 ? null : p))],
+  ['NaN coordinate', refLandmarks(mp).map((p, i) => (i === 25 ? { ...p, x: NaN } : p))],
+  ['undefined entry', refLandmarks(mp).map((p, i) => (i === 13 ? undefined : p))],
+]) {
+  let threw = null, ev = null;
+  try { ev = evaluate(mp, input); } catch (e) { threw = e; }
+  ok(`${name} does not throw`, !threw, threw ? threw.message : '');
+  if (ev) ok(`${name} scores nothing it cannot see`, ev.checks.every((c) => c.status !== 'unknown' ? Number.isFinite(c.value) : true));
+}
+ok('empty array yields no known checks', evaluate(mp, []).known === 0);
+ok('empty array scores 0', evaluate(mp, []).score === 0);
+
+// Degenerate geometry must read 'unknown', not land mid-range as a perfect score.
+const flatPlank = refLandmarks(POSE_BY_ID.plank).map((p, i) => (i === 27 || i === 28 ? { ...p, x: (refLandmarks(POSE_BY_ID.plank)[11].x) } : p));
+const degEv = evaluate(POSE_BY_ID.plank, flatPlank);
+ok('degenerate body line is not a free pass', st(degEv, 'line') !== 'good', String(st(degEv, 'line')));
+
+// ---------------------------------------------------------------------------
+// Corrupt calibration must be ignored rather than silently failing every frame.
+// ---------------------------------------------------------------------------
+console.log('\n— corrupt tuning is ignored —');
+const dd = POSE_BY_ID.downdog, ddlm = refLandmarks(dd);
+for (const [name, bad] of [
+  ['NaN range', { hips: [NaN, NaN] }],
+  ['reversed range', { hips: [95, 55] }],
+  ['wrong length', { hips: [90] }],
+  ['not an array', { hips: 90 }],
+]) {
+  const ev = evaluate(dd, ddlm, bad);
+  ok(`${name} falls back to shipped`, st(ev, 'hips') === 'good' && ev.checks.find((c) => c.id === 'hips').tuned === false);
+}
+
+// ---------------------------------------------------------------------------
+// Mirror-image faults must not score identically to correct form.
+// ---------------------------------------------------------------------------
+console.log('\n— sign-aware checks —');
+// Leaning BACK means the torso goes behind the hips while you still face the same
+// way. (Mirroring the head too would just be turning around, which is not a fault.)
+const chairBack = structuredClone(POSE_BY_ID.chair.ref);
+const cRef = POSE_BY_ID.chair.ref;
+const shMidX = (cRef.L.shoulder.x + cRef.R.shoulder.x) / 2;
+const hipMidX = (cRef.L.hip.x + cRef.R.hip.x) / 2;
+const headLead = cRef.nose.x - shMidX;          // where the head sits on the shoulders
+for (const side of ['L', 'R']) {
+  for (const part of ['shoulder', 'elbow', 'wrist']) {
+    chairBack[side][part] = { ...chairBack[side][part], x: 2 * hipMidX - chairBack[side][part].x };
+  }
+}
+chairBack.nose = { ...cRef.nose, x: (2 * hipMidX - shMidX) + headLead };   // head still leads the same way
+const cbEv = evaluate(POSE_BY_ID.chair, refLandmarks({ ref: chairBack }));
+ok('leaning back is not the same as hinging forward', st(cbEv, 'lean') !== 'good',
+  `${val(cbEv, 'lean').toFixed(1)} vs +${val(evaluate(POSE_BY_ID.chair, refLandmarks(POSE_BY_ID.chair)), 'lean').toFixed(1)} forward`);
+ok('lean-back cue names the fault', /leaning back/.test(cbEv.checks.find((c) => c.id === 'lean').cue));
+
+const w2In = structuredClone(POSE_BY_ID.warrior2.ref);
+w2In.L.knee = { x: 60, y: 130 };    // knee collapses inward toward the midline
+const inEv = evaluate(POSE_BY_ID.warrior2, refLandmarks({ ref: w2In }));
+ok('medial knee collapse is caught', st(inEv, 'track') !== 'good', val(inEv, 'track').toFixed(3));
+ok('collapse cue names the fault', /falling inward/.test(inEv.checks.find((c) => c.id === 'track').cue));
+const w2Out = structuredClone(POSE_BY_ID.warrior2.ref);
+w2Out.L.knee = { x: 24, y: 130 };   // same distance, but splayed outward
+const outEv = evaluate(POSE_BY_ID.warrior2, refLandmarks({ ref: w2Out }));
+ok('inward and outward are told apart', val(inEv, 'track') < 0 && val(outEv, 'track') > 0,
+  `in ${val(inEv, 'track').toFixed(2)}, out ${val(outEv, 'track').toFixed(2)}`);
+
+// ---------------------------------------------------------------------------
+// The flow advance rule itself, walked step by step.
+// ---------------------------------------------------------------------------
+console.log('\n— flow advance rule —');
+// Mirrors tickFlow: advance when the NEXT pose is entered and beats the current one.
+const advances = (curId, nextId, bodyId) => {
+  const body = refLandmarks(POSE_BY_ID[bodyId]);
+  const cur = evaluate(POSE_BY_ID[curId], body);
+  const nxt = evaluate(POSE_BY_ID[nextId], body);
+  return nxt.inPose && nxt.score >= 0.7 && nxt.score > cur.score;
+};
+for (const seq of SEQUENCES) {
+  let good = true, detail = '';
+  for (let i = 0; i < seq.steps.length - 1; i++) {
+    const [a, b] = [seq.steps[i], seq.steps[i + 1]];
+    if (advances(a, b, a)) { good = false; detail = `${a}→${b} fires while still in ${a}`; break; }
+    if (!advances(a, b, b)) { good = false; detail = `${a}→${b} does not fire when in ${b}`; break; }
+  }
+  ok(`${seq.id} advances once per step, never early`, good, detail);
+}
+// A body in some unrelated pose must not trigger an advance.
+ok('an unrelated shape does not advance the flow',
+  !advances('mountain', 'forwardfold', 'warrior2') && !advances('plank', 'chaturanga', 'tree'));
+
+// ---------------------------------------------------------------------------
+// store.js against an injected localStorage.
+// ---------------------------------------------------------------------------
+console.log('\n— store —');
+const mem = new Map();
+globalThis.localStorage = {
+  getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+  setItem: (k, v) => mem.set(k, String(v)),
+  removeItem: (k) => mem.delete(k),
+};
+mem.set('yf.history', JSON.stringify({ not: 'an array' }));
+mem.set('yf.tuning', JSON.stringify({ downdog: { hips: [NaN, NaN] }, plank: { line: [-0.4, 0.4] } }));
+const store = await import('./store.js');
+ok('wrong-shaped history degrades to empty', Array.isArray(store.history) && store.history.length === 0);
+ok('summary survives a corrupt history', store.summary().total === 0);
+ok('invalid tuning range is dropped', !store.tuningFor('downdog'));
+ok('valid tuning range survives', store.tuningFor('plank')?.line?.[0] === -0.4);
+ok('statsFor on an unpractised pose is null', store.statsFor('tree') === null);
+
+store.addEntry({ poseId: 'tree', name: 'Tree', secs: 20, score: 0.8, side: 'Left' });
+store.addEntry({ poseId: 'tree', name: 'Tree', secs: 20, score: 0.5, side: 'Right' });
+ok('statsFor pools both sides by default', store.statsFor('tree').count === 2);
+ok('statsFor can filter to one side', store.statsFor('tree', 'Right').best === 0.5,
+  String(store.statsFor('tree', 'Right').best));
+ok('streak counts today', store.streak() === 1);
+ok('write failure does not corrupt memory', (() => {
+  globalThis.localStorage.setItem = () => { throw new Error('QuotaExceeded'); };
+  store.addEntry({ poseId: 'plank', name: 'Plank', secs: 5, score: 1 });
+  return store.history.length === 3;
+})());
 
 console.log(fails ? `\n${fails} FAILING\n` : `\nall passing\n`);
 process.exit(fails ? 1 : 0);

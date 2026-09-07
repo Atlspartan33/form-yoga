@@ -26,7 +26,7 @@ const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 export function angleAt(a, b, c) {
   const abx = a.x - b.x, aby = a.y - b.y, cbx = c.x - b.x, cby = c.y - b.y;
   const m = Math.hypot(abx, aby) * Math.hypot(cbx, cby);
-  if (!m) return 0;
+  if (!(m > 0)) return NaN;   // NaN becomes 'unknown'; 0 would read as a perfect score
   return deg(Math.acos(clamp((abx * cbx + aby * cby) / m, -1, 1)));
 }
 /** Angle of segment a→b from horizontal, 0..90. */
@@ -39,7 +39,7 @@ const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 /** Vertical offset of p from line a–b at p.x, normalised later. Positive = p is BELOW the line. */
 function belowLine(p, a, b) {
   const dx = b.x - a.x;
-  if (Math.abs(dx) < 1e-6) return 0;
+  if (!(Math.abs(dx) > 1e-6)) return NaN;   // 0 sits mid-range and would score as perfect
   return p.y - (a.y + (p.x - a.x) * ((b.y - a.y) / dx));
 }
 
@@ -48,10 +48,11 @@ function belowLine(p, a, b) {
 // landmarks each measurement actually touched, so a check whose joints are hidden
 // can report "unknown" instead of a confident wrong number.
 export function makeContext(lm) {
-  const vis = (i) => lm[i]?.visibility ?? 1;
+  const vis = (i) => (lm[i] && Number.isFinite(lm[i].x) ? lm[i].visibility ?? 1 : 0);
+  const at0 = (i) => { const q = lm[i]; return q && Number.isFinite(q.x) && Number.isFinite(q.y) ? q : { x: NaN, y: NaN, visibility: 0 }; };
   const sideVis = (s) => ['shoulder', 'hip', 'knee', 'ankle'].reduce((t, k) => t + vis(SIDE[s][k]), 0);
   const near = sideVis('L') >= sideVis('R') ? 'L' : 'R';
-  const kneeAngle = (s) => angleAt(lm[SIDE[s].hip], lm[SIDE[s].knee], lm[SIDE[s].ankle]);
+  const kneeAngle = (s) => { const a = angleAt(at0(SIDE[s].hip), at0(SIDE[s].knee), at0(SIDE[s].ankle)); return Number.isFinite(a) ? a : 180; };
   const bent = kneeAngle('L') <= kneeAngle('R') ? 'L' : 'R';
   const roles = {
     near, far: near === 'L' ? 'R' : 'L',
@@ -66,16 +67,20 @@ export function makeContext(lm) {
     const [role, part] = name.split('.');
     return SIDE[roles[role]]?.[part];
   };
+  // A missing or malformed landmark resolves to an invisible NaN point rather than
+  // throwing: every measurement that touches it goes 'unknown' via the visibility gate.
+  const GONE = { x: NaN, y: NaN, visibility: 0 };
+  const at = (i) => { const q = lm[i]; return q && Number.isFinite(q.x) && Number.isFinite(q.y) ? q : GONE; };
   const p = (name) => {
-    if (name === 'nose') { touched.add(0); return lm[0]; }
+    if (name === 'nose') { touched.add(0); return at(0); }
     const [role, part] = name.split('.');
     if (role === 'mid') {
       touched.add(SIDE.L[part]); touched.add(SIDE.R[part]);
-      return mid(lm[SIDE.L[part]], lm[SIDE.R[part]]);
+      return mid(at(SIDE.L[part]), at(SIDE.R[part]));
     }
     const i = SIDE[roles[role]][part];
     touched.add(i);
-    return lm[i];
+    return at(i);
   };
 
   const torso = dist(p('mid.shoulder'), p('mid.hip')) || 1;
@@ -98,6 +103,22 @@ export function makeContext(lm) {
     tilt: () => {
       const s = p('mid.shoulder'), h = p('mid.hip');
       return fromHorizontal(h, s) * (s.y <= h.y ? 1 : -1);
+    },
+    // Which way the body faces. Measured from the head against the SHOULDERS, not the
+    // hips: with a near-vertical torso the head sits almost above the hips, so that
+    // comparison flips on noise, while the head-on-shoulders offset stays stable.
+    facing: () => Math.sign(p('nose').x - p('mid.shoulder').x) || 1,
+    /** Torso angle signed by lean direction: +ve leans the way you face, -ve leans back. */
+    leanSigned: () => {
+      const h = p('mid.hip'), sh = p('mid.shoulder'), n = p('nose');
+      const dir = Math.sign(sh.x - h.x) * (Math.sign(n.x - sh.x) || 1);
+      return fromVertical(h, sh) * (dir || 0);
+    },
+    /** Knee position along the foot's outward axis: -ve = collapsing inward toward the midline. */
+    kneeTrack: (knee, ankle) => {
+      const k = p(knee), a = p(ankle), h = p('mid.hip');
+      const outward = Math.sign(a.x - h.x) || 1;
+      return ((k.x - a.x) * outward) / shin;
     },
     // Where the hands are relative to the hips, in torso-lengths. +ve = below hips.
     reach: () => (p('near.wrist').y - p('mid.hip').y) / torso,
@@ -152,7 +173,10 @@ export const POSES = [
     gates: [G.tilt([62, 84]), G.reach([-2.3, -1.3], 0.3)],
     checks: [
       C('knees', 'Knee bend', (c) => c.angle('near.hip', 'near.knee', 'near.ankle'), [85, 125], (v) => (v > 125 ? 'Sit deeper, like into a chair' : 'Rise up a little'), { slack: 12, joints: ['near.knee'] }),
-      C('lean', 'Torso lean', (c) => c.vert('mid.hip', 'mid.shoulder'), [15, 45], (v) => (v < 15 ? 'Hinge forward from the hips' : 'Lift your chest, do not collapse forward'), { slack: 10, joints: ['near.shoulder', 'near.hip'] }),
+      C('lean', 'Torso lean', (c) => c.leanSigned(), [15, 45],
+        (v) => (v < 0 ? 'You are leaning back — hinge forward from the hips instead'
+          : v < 15 ? 'Hinge forward from the hips' : 'Lift your chest, do not collapse forward'),
+        { slack: 10, joints: ['near.shoulder', 'near.hip'] }),
       C('arms', 'Arms overhead', (c) => c.angle('near.hip', 'near.shoulder', 'near.wrist'), [150, 180], 'Reach your arms up in line with your ears', { slack: 15, joints: ['near.shoulder', 'near.wrist'] }),
       C('weight', 'Weight in heels', (c) => c.dx('near.knee', 'near.ankle') / c.shin, [0, 0.45], 'Shift your weight back into your heels', { slack: 0.15, unit: 'x', joints: ['near.knee', 'near.ankle'] }),
     ],
@@ -169,7 +193,10 @@ export const POSES = [
       C('backLeg', 'Back leg', (c) => c.angle('back.hip', 'back.knee', 'back.ankle'), [160, 180], 'Straighten your back leg', { slack: 10, joints: ['back.knee'] }),
       C('arms', 'Arms level', (c) => Math.max(c.horiz('L.shoulder', 'L.wrist'), c.horiz('R.shoulder', 'R.wrist')), [0, 12], 'Reach your arms out level with the floor', { slack: 8, joints: ['L.wrist', 'R.wrist'] }),
       C('torso', 'Torso upright', (c) => c.vert('mid.hip', 'mid.shoulder'), [0, 10], 'Stack your torso straight over your hips', { slack: 8, joints: ['L.shoulder', 'R.shoulder'] }),
-      C('track', 'Knee over ankle', (c) => c.dx('front.knee', 'front.ankle') / c.shin, [0, 0.3], 'Track your front knee out over your ankle', { slack: 0.15, unit: 'x', joints: ['front.knee', 'front.ankle'] }),
+      C('track', 'Knee over ankle', (c) => c.kneeTrack('front.knee', 'front.ankle'), [-0.05, 0.25],
+        (v) => (v < 0 ? 'Your front knee is falling inward — press it out toward your little toe'
+          : 'Ease your front knee back over your ankle'),
+        { slack: 0.12, unit: 'x', joints: ['front.knee', 'front.ankle'] }),
     ],
   },
   {
@@ -336,15 +363,17 @@ export function evaluate(pose, lm, tuning = null) {
     c.beginTouch();
     const value = ch.measure(c);
     const vis = c.touchedVis();
-    const range = tuning?.[ch.id] ?? ch.range;
-    const status = vis < MIN_JOINT_VIS ? 'unknown' : statusOf(range, ch.slack, value);
+    const t = tuning?.[ch.id];
+    const usable = Array.isArray(t) && Number.isFinite(t[0]) && Number.isFinite(t[1]) && t[0] <= t[1];
+    const range = usable ? t : ch.range;
+    const status = (vis < MIN_JOINT_VIS || !Number.isFinite(value)) ? 'unknown' : statusOf(range, ch.slack, value);
     const cue = typeof ch.cue === 'function' ? ch.cue(value) : ch.cue;
     return {
       id: ch.id, label: ch.label, value, unit: ch.unit, status, cue, range, slack: ch.slack,
       isGate: !!ch.isGate,
       joints: (ch.joints || []).map((n) => c.idxOf(n)).filter((i) => i != null),
       severity: status === 'unknown' ? 0 : severity(range, ch.slack, value),
-      tuned: !!tuning?.[ch.id],
+      tuned: usable,
     };
   };
   const gates = (pose.gates || []).map(run);
@@ -370,7 +399,7 @@ export function evaluate(pose, lm, tuning = null) {
     phase: pose.phase ? pose.phase(c) : null,
     side: pose.asymmetric ? (c.roles.front === 'L' ? 'Left' : 'Right') : null,
     torso: c.torso,
-    hip: { x: (lm[23].x + lm[24].x) / 2, y: (lm[23].y + lm[24].y) / 2 },
+    hip: c.p('mid.hip'),
   };
 }
 

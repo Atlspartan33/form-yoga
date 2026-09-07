@@ -6,7 +6,7 @@ import { demoSource } from './demo.js';
 
 // ?demo drives the session from a synthetic body — no camera, for testing and showing.
 const DEMO = new URLSearchParams(location.search).has('demo');
-let demoFn = null, demoT0 = 0;
+let demoFn = null, demoT0 = 0, ghostWarned = false;
 
 const { settings } = store;
 const MP = '0.10.14';
@@ -46,21 +46,30 @@ voice.init();
 if ('speechSynthesis' in window) speechSynthesis.onvoiceschanged = () => voice.init();
 
 // ---------------------------------------------------------------- camera + model
-let landmarker = null, stream = null, rafId = 0, wakeLock = null, lastVideoTime = -1;
+let landmarker = null, modelPromise = null, stream = null, rafId = 0, wakeLock = null, lastVideoTime = -1;
+let sumTimer = 0;
+// Every start claims a generation. Anything that finishes awaiting under a stale
+// generation cleans up after itself instead of taking over the camera.
+let gen = 0;
 
-async function loadModel() {
-  if (landmarker) return landmarker;
-  setStatus('Loading pose model…');
+// Single-flight: two taps during the (slow) first model download must not build two
+// PoseLandmarkers, which would leak the first and interleave timestamps into the second.
+function loadModel() {
+  if (modelPromise) return modelPromise;
+  modelPromise = (async () => {
+    setStatus('Loading pose model…');
   const { PoseLandmarker, FilesetResolver } = await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP}`);
-  const vision = await FilesetResolver.forVisionTasks(WASM_URL);
-  landmarker = await PoseLandmarker.createFromOptions(vision, {
-    baseOptions: { modelAssetPath: MODEL_URL(settings.model), delegate: 'GPU' },
-    runningMode: 'VIDEO', numPoses: 1,
-    minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5,
-  });
-  return landmarker;
+    const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+    landmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: MODEL_URL(settings.model), delegate: 'GPU' },
+      runningMode: 'VIDEO', numPoses: 1,
+      minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5,
+    });
+    return landmarker;
+  })().catch((e) => { modelPromise = null; throw e; });
+  return modelPromise;
 }
-async function startCamera() {
+async function startCamera(my) {
   stopCamera();
   if (DEMO) {
     demoFn = demoSource(S.pose); demoT0 = performance.now();
@@ -69,23 +78,29 @@ async function startCamera() {
     return;
   }
   setStatus('Starting camera…');
-  stream = await navigator.mediaDevices.getUserMedia({
+  const s = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: settings.facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false,
   });
-  el.cam.srcObject = stream;
+  // The user may have backed out while the permission sheet was up. Drop the stream
+  // rather than leaving the camera light on behind the home screen.
+  if (my !== gen) { s.getTracks().forEach((t) => t.stop()); return; }
+  stream = s;
+  el.cam.srcObject = s;
   await el.cam.play();
   el.stage.classList.toggle('mirror', settings.facing === 'user');
-  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  try { if (my === gen) wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
 }
 function stopCamera() {
   if (DEMO) clearTimeout(rafId); else cancelAnimationFrame(rafId);
   rafId = 0; lastVideoTime = -1;
   stream?.getTracks().forEach((t) => t.stop()); stream = null;
   el.cam.srcObject = null;
-  try { wakeLock?.release(); } catch {} wakeLock = null;
+  wakeLock?.release?.().catch(() => {}); wakeLock = null;
 }
 document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState === 'visible' && stream && !wakeLock) {
+  // The platform releases the sentinel when the page hides but leaves our reference
+  // intact, so !wakeLock is never true here - released is what actually changes.
+  if (document.visibilityState === 'visible' && stream && (!wakeLock || wakeLock.released)) {
     try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
   }
 });
@@ -113,8 +128,17 @@ const S = {
   inFrames: 0, nextFrames: 0, lostFrames: 0,
   holdStart: 0, holdMs: 0, countFrom: 0,
   chk: {}, flowLog: [], samples: {}, reps: 0, lastPhase: null, side: null,
-  ev: null, lm: null,
+  ev: null, lm: null, lastTick: 0,
 };
+
+/** Accrue hold time from frames actually seen. A backgrounded app or a lost body
+ *  stops accruing, instead of banking wall-clock the user never practised. */
+function advanceHold() {
+  const now = performance.now();
+  const dt = S.lastTick ? now - S.lastTick : 0;
+  S.lastTick = now;
+  if (dt > 0 && dt < 250) S.holdMs += dt;
+}
 
 function resetChecks(pose) {
   S.chk = {};
@@ -139,6 +163,7 @@ async function startFlow(id) {
   await begin(S.seq.name, `Step 1 · ${S.pose.name}`, S.seq.hint);
 }
 async function begin(title, sub, hint) {
+  const my = ++gen;
   show('session');
   el.poseName.textContent = title;
   el.poseSub.textContent = sub;
@@ -148,26 +173,38 @@ async function begin(title, sub, hint) {
   S.phase = 'setup'; S.inFrames = 0; S.nextFrames = 0; S.lostFrames = 0; S.holdMs = 0;
   smooth = null; voice.lastAt = 0; voice.lastText = '';
   resetChecks(S.pose);
-  renderChecks(null); renderTimer(0); renderFlow(); renderScore(0);
+  renderChecks(null); renderTimer(0); renderFlow(); renderScore(null);
   setState('Get in position'); cue(hint, '');
   try {
-    await (DEMO ? startCamera() : Promise.all([loadModel(), startCamera()]));
+    // allSettled, not all: if the model download fails we still have to stop the
+    // camera that succeeded, instead of leaving it live under an error message.
+    const outcome = await Promise.allSettled(DEMO ? [startCamera(my)] : [loadModel(), startCamera(my)]);
+    if (my !== gen) { stopCamera(); return; }
+    const bad = outcome.find((r) => r.status === 'rejected');
+    if (bad) throw bad.reason;
     setStatus('');
     voice.say(S.mode === 'flow' ? `${title}. Start in ${S.pose.name}.` : `${title}. ${hint}`, { force: true });
-    loop();
+    loop(my);
   } catch (e) {
     console.error(e);
-    setStatus(e.name === 'NotAllowedError'
+    stopCamera();
+    setStatus(e?.name === 'NotAllowedError'
       ? 'Camera blocked. Allow camera access for this page, then tap here to retry.'
-      : `Could not start: ${e.message}. Tap to retry.`, true);
+      : `Could not start: ${e?.message || e}. Tap to retry.`, true);
   }
 }
-function endSession() { stopCamera(); voice.stop(); S.phase = 'idle'; }
+function endSession() {
+  gen++;                       // invalidates any start still awaiting, and any live loop
+  stopCamera(); voice.stop();
+  clearTimeout(sumTimer); sumTimer = 0;
+  S.phase = 'idle';
+}
 
 // ---------------------------------------------------------------- loop
-function loop() {
+function loop(my) {
+  if (my !== gen) return;      // a newer session (or none) owns the camera now
   // Demo mode runs off a timer so it keeps ticking in a hidden tab (rAF does not).
-  rafId = DEMO ? setTimeout(loop, 33) : requestAnimationFrame(loop);
+  rafId = DEMO ? setTimeout(() => loop(my), 33) : requestAnimationFrame(() => loop(my));
   const v = el.cam;
   let raw, w, h;
 
@@ -199,7 +236,8 @@ function loop() {
   S.ev = ev; S.lm = lm;
 
   if (settings.ghost && S.phase !== 'done') {
-    try { drawGhost(ctx, fitRef(S.pose, ev, lm), Math.max(1, w / 900)); } catch {}
+    try { drawGhost(ctx, fitRef(S.pose, ev, lm), Math.max(1, w / 900)); }
+    catch (e) { if (!ghostWarned) { ghostWarned = true; console.warn('ghost overlay failed', e); } }
   }
   drawSkeleton(ctx, lm, ev, Math.max(1, w / 640));
 
@@ -212,22 +250,26 @@ function loop() {
 }
 function onLost(msg) {
   S.lostFrames++;
+  S.inFrames = 0;      // don't bank progress toward entering the pose across a gap
+  S.lastTick = 0;      // and don't bank the gap itself as hold time
   if (S.lostFrames > 45) { setState(msg); if (S.phase === 'hold') cue(msg, 'off'); }
 }
 
 // ---------------------------------------------------------------- pose mode
 function tickPose(ev) {
   if (S.phase === 'setup') {
-    renderChecks(ev); renderScore(ev.score);
+    renderChecks(ev); renderScore(ev);
     const ready = ev.inPose && ev.score >= 0.7;
-    S.inFrames = ready ? S.inFrames + 1 : 0;
+    // Decay rather than reset: a single noisy frame should not restart the entry
+    // count, or a body that wobbles slightly can never get into the pose at all.
+    S.inFrames = ready ? S.inFrames + 1 : Math.max(0, S.inFrames - 2);
     setState(ev.inPose ? (ready ? 'Almost…' : 'Adjust') : 'Get in position');
     setupGuidance(ev);
     if (S.inFrames >= ENTER_FRAMES) enterHold();
     return;
   }
   if (S.phase === 'countdown') {
-    renderChecks(ev); renderScore(ev.score);
+    renderChecks(ev); renderScore(ev);
     const left = 3 - Math.floor((performance.now() - S.countFrom) / 1000);
     el.timer.textContent = Math.max(1, left);
     el.ring.style.setProperty('--p', 0);
@@ -236,9 +278,9 @@ function tickPose(ev) {
   }
   if (S.phase !== 'hold') return;
 
-  S.holdMs = performance.now() - S.holdStart;
+  advanceHold();
   accumulate(ev);
-  renderChecks(ev); renderScore(ev.score); renderTimer(S.holdMs);
+  renderChecks(ev); renderScore(ev); renderTimer(S.holdMs);
   trackPhaseAndReps(ev);
   if (ev.side && !S.side) { S.side = ev.side; el.sideChip.hidden = false; el.sideChip.textContent = `${ev.side} side`; }
   coach(ev);
@@ -251,7 +293,7 @@ function enterHold() {
   } else startHold();
 }
 function startHold() {
-  S.phase = 'hold'; S.holdStart = performance.now(); S.side = null;
+  S.phase = 'hold'; S.holdStart = performance.now(); S.holdMs = 0; S.lastTick = 0; S.side = null;
   resetChecks(S.pose);
   setState('Holding'); cue('Hold it there', 'good');
   if (!settings.countdown) voice.say('In position. Hold.', { force: true });
@@ -308,19 +350,19 @@ function coach(ev) {
 
 // ---------------------------------------------------------------- calibrate mode
 function tickCalibrate(ev) {
-  renderChecks(ev); renderScore(ev.score);
+  renderChecks(ev); renderScore(ev);
   if (S.phase === 'setup') {
     S.inFrames = ev.inPose ? S.inFrames + 1 : 0;
     setState(ev.inPose ? 'Hold still…' : 'Get in position');
     if (!ev.inPose) cue(S.pose.hint, '');
     if (S.inFrames >= ENTER_FRAMES) {
-      S.phase = 'hold'; S.holdStart = performance.now(); resetChecks(S.pose);
+      S.phase = 'hold'; S.holdStart = performance.now(); S.holdMs = 0; S.lastTick = 0; resetChecks(S.pose);
       voice.say('Hold your best version. Recording.', { force: true });
     }
     return;
   }
   if (S.phase !== 'hold') return;
-  S.holdMs = performance.now() - S.holdStart;
+  advanceHold();
   accumulate(ev);
   const p = Math.min(1, S.holdMs / CALIBRATE_MS);
   el.ring.style.setProperty('--p', p);
@@ -338,10 +380,13 @@ function finishCalibrate() {
     const vals = S.samples[c.id];
     if (vals.length < 15) continue;
     const m = median(vals);
-    const [lo, hi] = (tuning()?.[c.id]) ?? c.range;
+    // Always widen from the SHIPPED range, never from an existing calibration, so
+    // repeated sessions on off days cannot ratchet a check open until it never fails.
+    const [lo, hi] = c.range;
     const margin = c.unit === '°' ? 3 : 0.03;
-    // Widen only — calibration should never make the checker stricter than shipped.
-    const next = [Math.min(lo, m - margin), Math.max(hi, m + margin)];
+    let next = [Math.min(lo, m - margin), Math.max(hi, m + margin)];
+    const cap = (hi - lo) * 1.5 + margin * 2;
+    if (next[1] - next[0] > cap) next = m > hi ? [next[1] - cap, next[1]] : [next[0], next[0] + cap];
     const changed = next[0] !== lo || next[1] !== hi;
     proposals.push({ id: c.id, label: c.label, unit: c.unit, median: m, from: [lo, hi], to: next, changed });
   }
@@ -355,9 +400,15 @@ function finishCalibrate() {
       <div class="lbl">${p.label}<span class="sub">you measured ${fmtValue(p.median, p.unit)}</span></div>
       <div class="pct ${p.changed ? 'warn' : 'ok'}">${p.changed ? `${fmtRange(p.from, p.unit)} → ${fmtRange(p.to, p.unit)}` : 'in range'}</div>
     </div>`).join('');
-  el.sumActions.innerHTML = changed.length
-    ? `<button class="btn primary" id="btnSaveCal">Save calibration</button><button class="btn" id="btnSkipCal">Discard</button>`
-    : `<button class="btn primary" id="btnSkipCal">Back</button>`;
+  el.sumActions.innerHTML = `
+    ${changed.length ? `<button class="btn primary" id="btnSaveCal">Save calibration</button>` : ''}
+    ${store.isTuned(S.pose.id) ? `<button class="btn" id="btnResetCal">Reset to shipped</button>` : ''}
+    <button class="btn" id="btnSkipCal">${changed.length ? 'Discard' : 'Back'}</button>`;
+  $('#btnResetCal')?.addEventListener('click', () => {
+    store.clearTuning(S.pose.id);
+    voice.say('Calibration reset.', { force: true });
+    renderHome(); show('home');
+  });
   $('#btnSaveCal')?.addEventListener('click', () => {
     store.saveTuning(S.pose.id, Object.fromEntries(changed.map((p) => [p.id, p.to])));
     voice.say('Calibration saved.', { force: true });
@@ -371,21 +422,23 @@ function finishCalibrate() {
 function tickFlow(ev) {
   const now = performance.now();
   if (S.phase === 'setup') {
-    renderChecks(ev); renderScore(ev.score);
+    renderChecks(ev); renderScore(ev);
     const ready = ev.inPose && ev.score >= 0.7;
-    S.inFrames = ready ? S.inFrames + 1 : 0;
+    // Decay rather than reset: a single noisy frame should not restart the entry
+    // count, or a body that wobbles slightly can never get into the pose at all.
+    S.inFrames = ready ? S.inFrames + 1 : Math.max(0, S.inFrames - 2);
     setState(ready ? 'Almost…' : `Start in ${S.pose.name}`);
     setupGuidance(ev);
-    if (S.inFrames >= 10) { S.phase = 'hold'; S.holdStart = now; enterStep(now); }
+    if (S.inFrames >= 10) { S.phase = 'hold'; S.holdStart = now; S.holdMs = 0; S.lastTick = 0; enterStep(now); }
     return;
   }
   if (S.phase !== 'hold') return;
-  S.holdMs = now - S.holdStart;
-  renderTimer(S.holdMs, false); renderChecks(ev); renderScore(ev.score);
+  advanceHold();
+  renderTimer(S.holdMs, false); renderChecks(ev); renderScore(ev);
   accumulate(ev); coach(ev);
   if (ev.side && !S.side) { S.side = ev.side; el.sideChip.hidden = false; el.sideChip.textContent = `${ev.side} side`; }
   const cur = S.flowLog.at(-1);
-  cur.bestScore = Math.max(cur.bestScore, ev.score);
+  cur.bestScore = Math.max(cur.bestScore, ev.formScore);
 
   const nextIdx = S.stepIdx + 1;
   if (nextIdx >= S.seq.steps.length) {
@@ -416,6 +469,7 @@ function enterStep(now) {
 function pct(x) { return `${Math.round(x * 100)}%`; }
 
 function finishPose() {
+  if (S.phase !== 'hold') return;
   S.phase = 'done'; stopCamera(); voice.stop();
   const secs = Math.round(S.holdMs / 1000);
   const rows = S.pose.checks.map((c) => {
@@ -427,7 +481,7 @@ function finishPose() {
   }).filter((r) => r.seen > 0).sort((a, b) => b.good - a.good);
 
   const overall = rows.length ? rows.reduce((t, r) => t + r.good + r.close * 0.5, 0) / rows.length : 0;
-  const prior = store.statsFor(S.pose.id);          // read before this hold is recorded
+  const prior = store.statsFor(S.pose.id, S.pose.asymmetric ? S.side : null);   // before this hold is recorded
   const isBest = rows.length && prior && overall > prior.best + 0.01;
   store.addEntry({
     poseId: S.pose.id, name: S.pose.name, secs, score: overall, side: S.side,
@@ -465,7 +519,7 @@ function finishPose() {
     <button class="btn" id="btnHome">Done</button>`;
   wireSummary();
   show('summary');
-  setTimeout(() => voice.say(text, { force: true }), 300);
+  sumTimer = setTimeout(() => voice.say(text, { force: true }), 300);
 }
 
 function finishFlow() {
@@ -489,7 +543,7 @@ function finishFlow() {
   el.sumActions.innerHTML = `<button class="btn primary" id="btnAgain">Again</button><button class="btn" id="btnHome">Done</button>`;
   wireSummary();
   show('summary');
-  setTimeout(() => voice.say(text, { force: true }), 300);
+  sumTimer = setTimeout(() => voice.say(text, { force: true }), 300);
 }
 function wireSummary() {
   $('#btnAgain')?.addEventListener('click', () => (S.mode === 'flow' ? startFlow(S.seq.id) : startPose(S.pose.id)));
@@ -537,7 +591,11 @@ function renderChecks(ev) {
     return `<div class="chk ${st}"><span class="dot"></span><span class="lbl">${c.label}${tuned}</span><span class="val">${v}</span></div>`;
   }).join('');
 }
-function renderScore(s) {
+// The live meter shows the same number the summary and history store: checks only,
+// gates excluded. Until you are in the shape at all, a form score is meaningless.
+function renderScore(ev) {
+  if (!ev || !ev.inPose) { el.scoreNum.textContent = '—'; el.scoreNum.className = ''; return; }
+  const s = ev.formScore;
   el.scoreNum.textContent = Math.round(s * 100);
   el.scoreNum.className = s >= 0.85 ? 'good' : s >= 0.6 ? 'close' : 'off';
 }
@@ -640,7 +698,8 @@ el.btnDone.addEventListener('click', () => {
   else { renderHome(); show('home'); }
 });
 el.statusMsg.addEventListener('click', () => {
-  if (S.pose) startPose(S.pose.id, S.mode === 'calibrate' ? 'calibrate' : 'pose');
+  if (S.mode === 'flow' && S.seq) startFlow(S.seq.id);
+  else if (S.pose) startPose(S.pose.id, S.mode === 'calibrate' ? 'calibrate' : 'pose');
 });
 
 renderHome(); show('home');
