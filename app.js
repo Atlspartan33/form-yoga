@@ -416,6 +416,8 @@ function finishPose() {
   }).filter((r) => r.seen > 0).sort((a, b) => b.good - a.good);
 
   const overall = rows.length ? rows.reduce((t, r) => t + r.good + r.close * 0.5, 0) / rows.length : 0;
+  const prior = store.statsFor(S.pose.id);          // read before this hold is recorded
+  const isBest = rows.length && prior && overall > prior.best + 0.01;
   store.addEntry({
     poseId: S.pose.id, name: S.pose.name, secs, score: overall, side: S.side,
     reps: S.pose.reps ? S.reps : null,
@@ -431,9 +433,10 @@ function finishPose() {
     text += `${worst.label} needs the work — in range only ${pct(worst.good)} of the time.`;
   }
   if (S.pose.reps && S.reps) text += ` ${S.reps} rep${S.reps === 1 ? '' : 's'}.`;
+  if (isBest) text += ' Best yet.';
 
   const stats = store.statsFor(S.pose.id);
-  el.sumTitle.textContent = `${S.pose.name} · ${secs}s`;
+  el.sumTitle.textContent = `${S.pose.name} · ${secs}s${isBest ? ' · best yet' : ''}`;
   el.sumLead.textContent = text;
   el.sumBody.innerHTML = rows.map((r) => `
     <div class="row bars">
@@ -442,8 +445,11 @@ function finishPose() {
       <div class="bar"><i class="g" style="width:${r.good * 100}%"></i><i class="c" style="width:${r.close * 100}%"></i><i class="o" style="width:${r.off * 100}%"></i></div>
     </div>`).join('') + (stats?.unbalanced ? `
     <p class="note">You have practised ${S.pose.name} ${stats.sides.Left} times on the left and ${stats.sides.Right} on the right. Even it up.</p>` : '');
+  const other = S.side === 'Left' ? 'right' : 'left';
   el.sumActions.innerHTML = `
-    <button class="btn primary" id="btnAgain">Again</button>
+    ${S.pose.asymmetric && S.side
+      ? `<button class="btn primary" id="btnAgain">Now the ${other} side</button>`
+      : `<button class="btn primary" id="btnAgain">Again</button>`}
     ${worst && worst.good < 0.6 ? `<button class="btn" id="btnCal">Calibrate</button>` : ''}
     <button class="btn" id="btnHome">Done</button>`;
   wireSummary();
