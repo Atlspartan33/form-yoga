@@ -141,5 +141,36 @@ for (const s of SEQUENCES) {
   ok(`${s.id} steps all exist`, s.steps.every((id) => POSE_BY_ID[id]), s.steps.join(' → '));
 }
 
+// ---------------------------------------------------------------------------
+// Ghost overlay fit: the reference must land on the user's hips, scale to their
+// torso, and flip when they face the other way.
+// ---------------------------------------------------------------------------
+console.log('\n— ghost overlay fit —');
+const { fitRef } = await import('./glyph.js');
+const { dist } = await import('./poses.js');
+
+const wd = POSE_BY_ID.downdog;
+const base = refLandmarks(wd);
+// A user twice the size of the reference, shifted to (1000, 400).
+const big = base.map((p) => ({ ...p, x: p.x * 2 + 880, y: p.y * 2 + 320 }));
+let bev = evaluate(wd, big);
+let g = fitRef(wd, bev, big);
+const gHip = { x: (g[23].x + g[24].x) / 2, y: (g[23].y + g[24].y) / 2 };
+ok('ghost hips land on the user hips',
+  Math.abs(gHip.x - bev.hip.x) < 0.5 && Math.abs(gHip.y - bev.hip.y) < 0.5,
+  `${gHip.x.toFixed(1)},${gHip.y.toFixed(1)} vs ${bev.hip.x.toFixed(1)},${bev.hip.y.toFixed(1)}`);
+const gTorso = dist({ x: (g[11].x + g[12].x) / 2, y: (g[11].y + g[12].y) / 2 }, gHip);
+ok('ghost torso matches user torso', Math.abs(gTorso - bev.torso) < 0.5, `${gTorso.toFixed(1)} vs ${bev.torso.toFixed(1)}`);
+ok('ghost lands on the user when they match the reference',
+  fitRef(wd, evaluate(wd, base), base).every((p, i) => i < 11 && i > 0 ? true : Math.abs(p.x - base[i].x) < 0.5 && Math.abs(p.y - base[i].y) < 0.5));
+
+// Mirror the user horizontally: the ghost must flip to face the same way.
+const flipped = base.map((p) => ({ ...p, x: 400 - p.x }));
+const fev = evaluate(wd, flipped);
+const gf = fitRef(wd, fev, flipped);
+const noseSideUser = Math.sign(flipped[0].x - fev.hip.x);
+const noseSideGhost = Math.sign(gf[0].x - (gf[23].x + gf[24].x) / 2);
+ok('ghost flips to match the user facing', noseSideUser === noseSideGhost, `user ${noseSideUser}, ghost ${noseSideGhost}`);
+
 console.log(fails ? `\n${fails} FAILING\n` : `\nall passing\n`);
 process.exit(fails ? 1 : 0);
