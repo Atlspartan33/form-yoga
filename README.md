@@ -81,6 +81,15 @@ One camera cannot measure depth. Twists and anything pointed at the lens read po
 says `hidden` rather than guessing when a joint it needs isn't visible. These are alignment cues,
 not verdicts, and never medical advice.
 
+**Cat–Cow is only half-measured.** MediaPipe gives no mid-spine landmark, so spinal flexion — which
+*is* the pose — can't be measured from these 33 points. What the checks actually score is the
+tabletop base underneath it: shoulders over wrists, hips over knees, arms straight. The Cat/Cow
+phase label and the rep counter track the movement from head height, which works, but nothing is
+grading the shape of your spine.
+
+**Target ranges are hand-authored.** They're informed guesses, not population data. When one is
+wrong for your body, that's a bug in the number, not in you — hit Calibrate.
+
 ## Files
 
 | | |
